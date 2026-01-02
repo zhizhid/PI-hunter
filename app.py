@@ -328,7 +328,7 @@ def identify_unique_pis(grants: list, search_name: str) -> dict:
 
     for grant in grants:
         grant_org = grant.get("organization", {}).get("org_name", "Unknown")
-        grant_start = grant.get("project_start_date", "")
+        grant_start = grant.get("project_start_date") or ""  # Ensure not None
         pis = grant.get("principal_investigators", [])
 
         for pi in pis:
