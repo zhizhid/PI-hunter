@@ -5,6 +5,7 @@ Searches NIH Reporter for a researcher's active grants and estimates
 the recruitment value (portable funding) they could bring.
 """
 
+import re
 import streamlit as st
 import requests
 import pandas as pd
@@ -80,13 +81,36 @@ PORTABILITY_SCORES = {
 DEFAULT_PORTABILITY = 0.50
 
 
-def get_portability_score(activity_code: str) -> float:
-    """Get portability score for a grant type."""
+# Large grants (>$X) are almost always center/coordinating grants
+# Apply a steep discount to portability since they're rarely transferable
+LARGE_GRANT_PORTABILITY_DISCOUNTS = [
+    (10_000_000, 0.05),  # >$10M: 5% of normal portability
+    (5_000_000, 0.10),   # >$5M: 10% of normal portability
+    (3_000_000, 0.25),   # >$3M: 25% of normal portability
+]
+
+
+def get_portability_score(activity_code: str, award_amount: float = 0) -> float:
+    """
+    Get portability score for a grant type.
+
+    Large grants (>$3M) get a steep discount because they're almost always
+    center grants, data coordinating centers, or consortium grants that
+    cannot transfer with a PI.
+    """
     if not activity_code:
-        return DEFAULT_PORTABILITY
-    # Extract base activity code (e.g., "R01" from "R01A")
-    base_code = ''.join(c for c in activity_code[:3] if c.isalnum())
-    return PORTABILITY_SCORES.get(base_code, DEFAULT_PORTABILITY)
+        base_score = DEFAULT_PORTABILITY
+    else:
+        # Extract base activity code (e.g., "R01" from "R01A")
+        base_code = ''.join(c for c in activity_code[:3] if c.isalnum())
+        base_score = PORTABILITY_SCORES.get(base_code, DEFAULT_PORTABILITY)
+
+    # Apply large grant discount
+    for threshold, multiplier in LARGE_GRANT_PORTABILITY_DISCOUNTS:
+        if award_amount >= threshold:
+            return base_score * multiplier
+
+    return base_score
 
 
 def get_portability_category(score: float) -> str:
@@ -408,7 +432,7 @@ ALWAYS_MULTI_YEAR_MECHANISMS = {
     "DP5",  # NIH Director's Early Independence Award
 }
 
-# Typical annual award ranges for common mechanisms (direct costs)
+# Typical annual award ranges for common mechanisms (total costs)
 # Used to detect if an award is multi-year funded based on amount
 TYPICAL_ANNUAL_RANGES = {
     "R01": (150000, 800000),   # Typical R01: $150K-$800K/year
@@ -418,109 +442,125 @@ TYPICAL_ANNUAL_RANGES = {
     "U01": (200000, 1000000),  # U01: varies widely
 }
 
-
 def detect_multi_year_funding(activity_code: str, award_amount: float,
-                               project_start: str, project_end: str) -> bool:
+                               budget_start: str, budget_end: str) -> tuple:
     """
-    Detect if a grant is multi-year funded based on award amount and project duration.
+    Detect if a grant is multi-year funded based on budget period.
 
-    Returns True if the award appears to be a multi-year total rather than annual.
+    Returns (is_multi_year, budget_years) tuple.
+    - is_multi_year: True if budget period > 1 year (multi-year funded)
+    - budget_years: Length of budget period in years
     """
-    if not activity_code or not award_amount:
-        return False
+    if not activity_code:
+        return False, 1.0
 
     code = activity_code[:3]
 
     # Always multi-year funded mechanisms
     if code in ALWAYS_MULTI_YEAR_MECHANISMS:
-        return True
+        # Calculate budget period if available
+        if budget_start and budget_end:
+            try:
+                start = datetime.strptime(budget_start[:10], "%Y-%m-%d").date()
+                end = datetime.strptime(budget_end[:10], "%Y-%m-%d").date()
+                budget_years = (end - start).days / 365.25
+                return True, max(1.0, budget_years)
+            except (ValueError, TypeError, AttributeError):
+                pass
+        return True, 4.0  # Assume 4 years if no budget dates
 
-    # Calculate project duration
-    try:
-        if project_start and project_end:
-            start = datetime.strptime(project_start[:10], "%Y-%m-%d").date()
-            end = datetime.strptime(project_end[:10], "%Y-%m-%d").date()
-            total_years = (end - start).days / 365.25
-        else:
-            return False  # Can't determine without dates
-    except:
-        return False
+    # Very large grants (>$3M) are almost always multi-year funded or center grants
+    if award_amount and award_amount >= 3_000_000:
+        if budget_start and budget_end:
+            try:
+                start = datetime.strptime(budget_start[:10], "%Y-%m-%d").date()
+                end = datetime.strptime(budget_end[:10], "%Y-%m-%d").date()
+                budget_years = (end - start).days / 365.25
+                return True, max(1.0, budget_years)
+            except (ValueError, TypeError, AttributeError):
+                pass
+        return True, 5.0  # Assume 5 years for large grants
 
-    if total_years <= 0:
-        return False
+    # Check budget period - if > 1 year, it's multi-year funded
+    if budget_start and budget_end:
+        try:
+            start = datetime.strptime(budget_start[:10], "%Y-%m-%d").date()
+            end = datetime.strptime(budget_end[:10], "%Y-%m-%d").date()
+            budget_years = (end - start).days / 365.25
+            if budget_years > 1.5:  # More than 1.5 years = multi-year funded
+                return True, budget_years
+            else:
+                return False, 1.0
+        except (ValueError, TypeError, AttributeError):
+            return False, 1.0
 
-    # Calculate what the annual amount would be if this is multi-year funded
-    implied_annual = award_amount / total_years
-
-    # Get typical annual range for this mechanism
-    if code in TYPICAL_ANNUAL_RANGES:
-        min_annual, max_annual = TYPICAL_ANNUAL_RANGES[code]
-    else:
-        # Default range for unknown mechanisms
-        min_annual, max_annual = 100000, 1000000
-
-    # If award_amount is much higher than typical annual, but implied_annual is reasonable,
-    # then it's likely multi-year funded
-    if award_amount > max_annual * 1.5 and min_annual <= implied_annual <= max_annual * 1.2:
-        return True
-
-    return False
+    return False, 1.0
 
 
 def calculate_remaining_funds(award_amount: float, project_start: str, project_end: str,
-                              activity_code: str = "") -> tuple:
+                              activity_code: str = "", budget_start: str = None,
+                              budget_end: str = None) -> tuple:
     """
     Calculate estimated remaining unspent funds for a grant.
 
-    Automatically detects if grant is multi-year funded based on:
-    1. Known multi-year mechanisms (RF1, DP1, DP2, DP5)
-    2. Award amount vs project duration (if award >> typical annual but award/years is reasonable)
+    Uses budget_start and budget_end to detect multi-year funding:
+    - If budget period > 1 year, grant is multi-year funded (all money paid upfront)
+    - For multi-year: remaining = award * (budget_time_left / budget_period)
+    - For annual: remaining = award * years_remaining_in_project
 
-    For standard grants: remaining = annual_award * years_left
-    For multi-year funded: remaining = total_award * (time_left / total_time)
-
-    Returns (remaining_funds, years_remaining, total_project_years)
+    Returns (remaining_funds, years_remaining, total_years)
     """
     if not project_end or not award_amount:
         return 0.0, 0.0, 0.0
 
     try:
-        end_date = datetime.strptime(project_end[:10], "%Y-%m-%d").date()
+        project_end_date = datetime.strptime(project_end[:10], "%Y-%m-%d").date()
         today = date.today()
 
-        if end_date <= today:
+        if project_end_date <= today:
             return 0.0, 0.0, 0.0  # Grant has ended
 
-        # Calculate years remaining
-        days_remaining = (end_date - today).days
-        years_remaining = days_remaining / 365.25
+        # Detect if multi-year funded using budget period
+        is_multi_year, budget_years = detect_multi_year_funding(
+            activity_code, award_amount, budget_start, budget_end
+        )
 
-        # Calculate total project period
-        if project_start:
-            start_date = datetime.strptime(project_start[:10], "%Y-%m-%d").date()
-            total_days = (end_date - start_date).days
-            total_years = total_days / 365.25
-        else:
-            total_years = 5.0  # Assume 5-year grant if no start date
+        if is_multi_year and budget_start and budget_end:
+            # Multi-year funded: use budget period for calculation
+            budget_start_date = datetime.strptime(budget_start[:10], "%Y-%m-%d").date()
+            budget_end_date = datetime.strptime(budget_end[:10], "%Y-%m-%d").date()
 
-        # Detect if multi-year funded
-        is_multi_year = detect_multi_year_funding(activity_code, award_amount,
-                                                   project_start, project_end)
-
-        if is_multi_year:
-            # Multi-year funded: award_amount is TOTAL for entire project
-            # Remaining = total * (time_remaining / total_time)
-            if total_years > 0:
-                fraction_remaining = years_remaining / total_years
-                remaining_funds = award_amount * fraction_remaining
+            # If budget hasn't started yet, all funds remain
+            if today < budget_start_date:
+                years_remaining = budget_years
+                remaining_funds = award_amount
+            elif today >= budget_end_date:
+                return 0.0, 0.0, budget_years  # Budget period ended
             else:
-                remaining_funds = 0.0
+                # Calculate remaining based on budget period
+                days_remaining = (budget_end_date - today).days
+                years_remaining = days_remaining / 365.25
+                fraction_remaining = years_remaining / budget_years
+                remaining_funds = award_amount * fraction_remaining
+
+            return remaining_funds, years_remaining, budget_years
+
         else:
             # Standard annual funding: award_amount is per year
-            # Remaining = annual * years_remaining
-            remaining_funds = award_amount * years_remaining
+            # Calculate years remaining until project end
+            days_remaining = (project_end_date - today).days
+            years_remaining = days_remaining / 365.25
 
-        return remaining_funds, years_remaining, total_years
+            # Calculate total project period for display
+            if project_start:
+                start_date = datetime.strptime(project_start[:10], "%Y-%m-%d").date()
+                total_days = (project_end_date - start_date).days
+                total_years = total_days / 365.25
+            else:
+                total_years = 5.0
+
+            remaining_funds = award_amount * years_remaining
+            return remaining_funds, years_remaining, total_years
 
     except (ValueError, TypeError):
         return 0.0, 0.0, 0.0
@@ -547,14 +587,14 @@ def calculate_recruitment_value(grants: list, target_pi_name: str) -> dict:
     optimistic_value = 0.0
     total_remaining_unspent = 0.0
 
-    target_name_lower = target_pi_name.lower()
-
     for grant in grants:
         # Extract grant info
         activity_code = grant.get("activity_code", "")
         award_amount = grant.get("award_amount", 0) or 0
         project_end = grant.get("project_end_date", "")
         project_start = grant.get("project_start_date", "")
+        budget_start = grant.get("budget_start", "")
+        budget_end = grant.get("budget_end", "")
 
         # Get PI information
         principal_investigators = grant.get("principal_investigators", [])
@@ -563,14 +603,15 @@ def calculate_recruitment_value(grants: list, target_pi_name: str) -> dict:
         is_multi_pi = num_pis > 1
 
         for pi in principal_investigators:
-            pi_name = pi.get("full_name", "").lower()
-            if target_name_lower in pi_name or pi_name in target_name_lower:
+            pi_full_name = pi.get("full_name", "")
+            if names_match(target_pi_name, pi_full_name):
                 is_contact_pi = pi.get("is_contact_pi", False)
                 break
 
         # Calculate remaining unspent funds
         remaining_funds, years_remaining, total_years = calculate_remaining_funds(
-            award_amount, project_start, project_end, activity_code
+            award_amount, project_start, project_end, activity_code,
+            budget_start, budget_end
         )
 
         # For Multi-PI: divide equally among all PIs
@@ -581,8 +622,8 @@ def calculate_recruitment_value(grants: list, target_pi_name: str) -> dict:
             pi_share = 1.0
             pi_remaining_funds = remaining_funds
 
-        # Calculate portability
-        portability = get_portability_score(activity_code)
+        # Calculate portability (with large grant discount)
+        portability = get_portability_score(activity_code, award_amount)
 
         # Calculate weighted recruitment value (portable funds)
         weighted_value = pi_remaining_funds * portability
@@ -819,44 +860,165 @@ if grants_to_process:
         df = pd.DataFrame(results["grants_detail"])
 
         # Grant breakdown chart
-        col1, col2 = st.columns(2)
+        st.subheader("PI's Remaining Funds by Grant")
+        fig = px.bar(
+            df.sort_values("pi_remaining_funds", ascending=True),
+            x="pi_remaining_funds",
+            y="project_num",
+            orientation="h",
+            color="portability_category",
+            color_discrete_map={
+                "Highly Portable": "#2ecc71",
+                "Likely Portable": "#3498db",
+                "Partially Portable": "#f39c12",
+                "Unlikely to Transfer": "#e74c3c"
+            },
+            labels={"pi_remaining_funds": "PI's Remaining Funds ($)", "project_num": "Grant"},
+            hover_data=["project_title", "activity_code", "organization", "num_pis", "years_remaining"]
+        )
+        fig.update_layout(height=max(400, len(df) * 40))
+        st.plotly_chart(fig, use_container_width=True)
 
-        with col1:
-            st.subheader("PI's Remaining Funds by Grant")
-            fig = px.bar(
-                df.sort_values("pi_remaining_funds", ascending=True),
-                x="pi_remaining_funds",
-                y="project_num",
-                orientation="h",
-                color="portability_category",
-                color_discrete_map={
-                    "Highly Portable": "#2ecc71",
-                    "Likely Portable": "#3498db",
-                    "Partially Portable": "#f39c12",
-                    "Unlikely to Transfer": "#e74c3c"
-                },
-                labels={"pi_remaining_funds": "PI's Remaining Funds ($)", "project_num": "Grant"},
-                hover_data=["project_title", "activity_code", "organization", "num_pis", "years_remaining"]
-            )
-            fig.update_layout(height=max(400, len(df) * 40))
-            st.plotly_chart(fig, use_container_width=True)
+        # Remaining funds by year chart (projected with even burn rate)
+        st.subheader("PI's Remaining Funds by End of Year")
 
-        with col2:
-            st.subheader("Remaining Funds by Grant Type")
-            type_summary = df.groupby("activity_code").agg({
-                "pi_remaining_funds": "sum",
-                "project_num": "count"
-            }).reset_index()
-            type_summary.columns = ["Grant Type", "PI Remaining Funds", "Count"]
+        # Calculate remaining funds at end of each year assuming even burn
+        today = date.today()
+        current_year = today.year
 
-            fig2 = px.pie(
-                type_summary,
-                values="PI Remaining Funds",
-                names="Grant Type",
-                hole=0.4
-            )
-            fig2.update_layout(height=400)
-            st.plotly_chart(fig2, use_container_width=True)
+        # Find the range of years to display
+        df_yearly = df.copy()
+        df_yearly["end_date"] = pd.to_datetime(df_yearly["project_end"])
+        max_end_year = df_yearly["end_date"].dt.year.max()
+        years = list(range(current_year, int(max_end_year) + 1))
+
+        # Build data for stacked bar chart - one row per grant per time period
+        stacked_data = []
+
+        # Add "Now" data for each grant
+        for _, grant in df.iterrows():
+            stacked_data.append({
+                "Year": "Now",
+                "Grant": grant["project_num"],
+                "Remaining Funds": grant["pi_remaining_funds"],
+                "Portability": grant["portability_category"]
+            })
+
+        # Add data for each future year end
+        for year in years:
+            year_end = date(year, 12, 31)
+
+            for _, grant in df.iterrows():
+                try:
+                    grant_end = datetime.strptime(grant["project_end"][:10], "%Y-%m-%d").date()
+                except (ValueError, TypeError, AttributeError):
+                    continue
+
+                # Skip if grant ends before this year end
+                if grant_end <= year_end:
+                    continue
+
+                # Calculate remaining at year end assuming even burn
+                pi_remaining_now = grant["pi_remaining_funds"]
+                years_remaining_now = grant["years_remaining"]
+
+                if years_remaining_now <= 0:
+                    continue
+
+                # Annual burn rate
+                annual_burn = pi_remaining_now / years_remaining_now
+
+                # Time from now to year end
+                days_to_year_end = (year_end - today).days
+                years_to_year_end = days_to_year_end / 365.25
+
+                # Remaining at year end
+                remaining_at_year_end = pi_remaining_now - (annual_burn * years_to_year_end)
+                if remaining_at_year_end > 0:
+                    stacked_data.append({
+                        "Year": str(year),
+                        "Grant": grant["project_num"],
+                        "Remaining Funds": remaining_at_year_end,
+                        "Portability": grant["portability_category"]
+                    })
+
+        stacked_df = pd.DataFrame(stacked_data)
+
+        # Base colors for each portability category (will create shades)
+        portability_base_colors = {
+            "Highly Portable": (46, 204, 113),      # Green
+            "Likely Portable": (52, 152, 219),      # Blue
+            "Partially Portable": (243, 156, 18),   # Orange
+            "Unlikely to Transfer": (231, 76, 60)   # Red
+        }
+
+        # Assign shade variation per grant based on category
+        unique_grants = list(df["project_num"].unique())
+        grant_colors = {}
+        category_counts = {}
+
+        for grant_num in unique_grants:
+            grant_row = df[df["project_num"] == grant_num].iloc[0]
+            category = grant_row["portability_category"]
+
+            if category not in category_counts:
+                category_counts[category] = 0
+            idx = category_counts[category]
+            category_counts[category] += 1
+
+            # Create shade variation
+            base_r, base_g, base_b = portability_base_colors.get(category, (128, 128, 128))
+            shade_factor = 0.7 + (idx * 0.15)
+            shade_factor = min(1.2, shade_factor)
+            r = min(255, int(base_r * shade_factor))
+            g = min(255, int(base_g * shade_factor))
+            b = min(255, int(base_b * shade_factor))
+            grant_colors[grant_num] = f"rgb({r},{g},{b})"
+
+        # Build stacked bar chart using go.Figure
+        fig_yearly = go.Figure()
+
+        # Ensure Year column is string type for consistent matching
+        stacked_df["Year"] = stacked_df["Year"].astype(str)
+
+        # Only include time periods that have data
+        # Order: years descending, then Now at end (so Now appears at top of chart)
+        periods_with_data = stacked_df['Year'].unique().tolist()
+        year_periods = sorted([x for x in periods_with_data if x != 'Now'], reverse=True)
+        ordered_periods = year_periods + (['Now'] if 'Now' in periods_with_data else [])
+
+        # Add one trace per grant - each trace has values for all time periods (horizontal bars)
+        for grant_num in unique_grants:
+            # Get values for this grant at each time period
+            x_values = []
+            for period in ordered_periods:
+                match = stacked_df[(stacked_df["Grant"] == grant_num) & (stacked_df["Year"] == str(period))]
+                if len(match) > 0:
+                    x_values.append(match["Remaining Funds"].values[0])
+                else:
+                    x_values.append(0)
+
+            fig_yearly.add_trace(go.Bar(
+                name=grant_num,
+                y=ordered_periods,
+                x=x_values,
+                orientation='h',
+                marker_color=grant_colors[grant_num],
+                hovertemplate=f"<b>{grant_num}</b><br>%{{y}}: $%{{x:,.0f}}<extra></extra>"
+            ))
+
+        # Calculate max x value for setting axis limit
+        max_x = stacked_df.groupby("Year")["Remaining Funds"].sum().max()
+
+        fig_yearly.update_layout(
+            barmode='stack',
+            height=max(500, len(ordered_periods) * 120),
+            xaxis_title="Total Remaining Funds ($)",
+            xaxis=dict(range=[0, max_x * 1.05]),
+            yaxis=dict(type='category'),  # Simplified - just set type to category
+            showlegend=False,
+        )
+        st.plotly_chart(fig_yearly, use_container_width=True)
 
         # Detailed table
         st.markdown("---")
@@ -909,7 +1071,9 @@ if grants_to_process:
         # CSV download button
         with col_header2:
             csv = export_df.to_csv(index=False)
-            safe_name = pi_name_for_calc.replace(" ", "_").replace(",", "")
+            # Sanitize filename: remove/replace filesystem-unsafe characters
+            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', pi_name_for_calc)
+            safe_name = safe_name.replace(" ", "_").replace(",", "").strip("_.")
             st.download_button(
                 label="Export to CSV",
                 data=csv,
